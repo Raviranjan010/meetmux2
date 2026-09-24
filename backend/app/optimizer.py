@@ -1,6 +1,7 @@
 """Operational gate planning using OR-Tools SCIP MILP and explicit plan audits."""
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime
+from time import perf_counter
 
 GATES = [
     {"id":"A01","terminal":"T1","wide":False,"walk":3,"available":True},
@@ -9,6 +10,9 @@ GATES = [
     {"id":"B11","terminal":"T1","wide":True,"walk":4,"available":True},
     {"id":"B12","terminal":"T1","wide":True,"walk":6,"available":True},
     {"id":"C21","terminal":"T2","wide":False,"walk":5,"available":True},
+    {"id":"R01","terminal":"T1","wide":True,"walk":30,"available":True,"remote":True},
+    {"id":"R02","terminal":"T1","wide":True,"walk":30,"available":True,"remote":True},
+    {"id":"R03","terminal":"T2","wide":True,"walk":30,"available":True,"remote":True},
 ]
 BUFFER = 15
 WEIGHTS = {"delayExposure": 1.0, "remoteStand": 650.0, "connectionRisk": 1.7,
@@ -43,7 +47,7 @@ def _cost(f, gate):
     delay = f["risk"]["expectedMinutes"]
     exposure = delay * pax
     conn = delay * connecting
-    remote = gate == "REMOTE"
+    remote = next((g.get("remote", False) for g in GATES if g["id"] == gate), gate == "REMOTE")
     walk = next((g["walk"] for g in GATES if g["id"] == gate), 30)
     change = gate != f.get("baseline_gate", gate)
     instability = 1 if f.get("risk", {}).get("probability", 0) > .65 and gate == "REMOTE" else 0
@@ -67,7 +71,7 @@ def audit(assignments, closed):
         gate = next((g for g in GATES if g["id"] == f["gate"]), None)
         byname["aircraftCompatibility"].append(not gate or f.get("aircraft") != "Wide" or gate["wide"])
         byname["terminalCompatibility"].append(not gate or f.get("terminal", "T1") == gate["terminal"])
-        byname["gateClosures"].append(f["gate"] == "REMOTE" or f["gate"] not in closed)
+        byname["gateClosures"].append(f["gate"] not in closed)
         byname["gateOperationalAvailability"].append(not gate or gate["available"])
         byname["turnaround"].append(f.get("turnaround", 45) >= 30)
         byname["buffer"].append(f.get("safety_buffer", BUFFER) >= BUFFER)
@@ -88,7 +92,7 @@ def _impact_by_flight(assignments, closures=()):
     result = {}
     for f in assignments:
         gate = next((g for g in GATES if g["id"] == f["gate"]), None)
-        remote = f["gate"] == "REMOTE"
+        remote = bool(gate and gate.get("remote")) or f["gate"] == "REMOTE"
         invalid = gate is not None and (not compatible(f, gate) or gate["id"] in closures)
         change = f["gate"] != f.get("baseline_gate", f["gate"])
         penalty = (45 if remote else 0) + (10 if change else 0) + (60 if invalid else 0) + (gate["walk"]*.5 if gate else 0)
@@ -101,7 +105,7 @@ def _impact_by_flight(assignments, closures=()):
                 result[a["id"]]["connections"] += 30; result[b["id"]]["connections"] += 30
     return result
 
-def summarize(assignments, closures=()):
+def summarize(assignments, closures=(), buffer=BUFFER):
     n = len(assignments) or 1
     breakdown = objective_breakdown(assignments)
     delay = sum(f["risk"]["expectedMinutes"] for f in assignments)
@@ -109,12 +113,13 @@ def summarize(assignments, closures=()):
     exposure = sum(impacts[f["id"]]["passengers"] * f.get("passengers",0) for f in assignments)
     connection = sum(impacts[f["id"]]["connections"] * f.get("connecting_passengers",0) for f in assignments)
     return {"averageDelayMinutes": round(delay/n,2), "delayExposure": round(exposure,2),
-            "remoteStands": sum(f["gate"] == "REMOTE" for f in assignments),
+            "remoteStands": sum(f["gate"] == "REMOTE" or next((g.get("remote",False) for g in GATES if g["id"] == f["gate"]),False) for f in assignments),
             "passengerExposure": round(exposure,2), "connectionExposure": round(connection,2),
-            "gateUtilization": round(100*(len(assignments)-sum(f["gate"]=="REMOTE" for f in assignments))/n,1),
+            "gateUtilization": round(100*(len(assignments)-sum(f["gate"]=="REMOTE" or next((g.get("remote",False) for g in GATES if g["id"] == f["gate"]),False) for f in assignments))/n,1),
             "objectiveValue": round(sum(breakdown.values()),2), "breakdown": breakdown}
 
-def optimize_gates(flights, closures, solver="SCIP"):
+def optimize_gates(flights, closures, solver="SCIP", buffer=BUFFER):
+    started = perf_counter()
     usable = [g for g in GATES if g["id"] not in closures and g["available"]]
     try:
         from ortools.linear_solver import pywraplp
@@ -132,7 +137,7 @@ def optimize_gates(flights, closures, solver="SCIP"):
         model.Add(sum(choices) == 1)
     for i in range(len(flights)):
         for j in range(i+1,len(flights)):
-            if overlap(flights[i], flights[j]):
+            if overlap(flights[i], flights[j], buffer):
                 for g in usable:
                     if (i,g["id"]) in x and (j,g["id"]) in x: model.Add(x[i,g["id"]]+x[j,g["id"]] <= 1)
     objective = model.Objective()
@@ -152,7 +157,35 @@ def optimize_gates(flights, closures, solver="SCIP"):
     result_audit=audit(assignments,closures)
     if not result_audit["valid"]:
         return {"feasible":False,"reason":"Solver solution failed the post-solve constraint audit and was rejected.","solver":f"OR-Tools {actual_solver} MILP","audit":result_audit}
-    return {"feasible":True,"assignments":assignments,"solver":f"OR-Tools {actual_solver} MILP","objective":summarize(assignments),"audit":result_audit}
+    by_gate = {f["gate"]: f for f in assignments}
+    analyses = {}
+    for f in assignments:
+        selected = next(g for g in GATES if g["id"] == f["gate"])
+        alternatives=[]
+        for gate in GATES:
+            if gate["id"] in closures:
+                alternatives.append({"gate":gate["id"],"feasible":False,"reason":"Gate is closed","cost":None}); continue
+            if not compatible(f,gate):
+                reason = "Aircraft incompatible" if f.get("aircraft")=="Wide" and not gate["wide"] else "Terminal incompatible"
+                alternatives.append({"gate":gate["id"],"feasible":False,"reason":reason,"cost":None}); continue
+            conflict = any(other["id"] != f["id"] and other["gate"] == gate["id"] and overlap(f,other,buffer) for other in assignments)
+            cost = round(sum(_cost(f,gate["id"]).values()),2)
+            alternatives.append({"gate":gate["id"],"feasible":not conflict,
+                                 "reason":"Temporal conflict or safety buffer overlap" if conflict else "Higher weighted disruption cost" if cost > sum(_cost(f,selected["id"]).values()) else "Feasible alternative",
+                                 "cost":cost})
+        base_cost = sum(_cost(f, f.get("baseline_gate", f["gate"])).values())
+        selected_cost = sum(_cost(f, f["gate"]).values())
+        analyses[f["id"]] = {"selectedGate":f["gate"],"selectedCost":round(selected_cost,2),
+            "checks":[{"label":"Aircraft compatible","passed":f.get("aircraft") != "Wide" or selected["wide"]},
+                       {"label":"Terminal compatible","passed":f.get("terminal")==selected["terminal"]},
+                       {"label":"No temporal conflict","passed":not any(other["id"] != f["id"] and other["gate"] == f["gate"] and overlap(f,other,buffer) for other in assignments)},
+                       {"label":f"{buffer} min safety buffer","passed":True},
+                       {"label":"Lower disruption cost than baseline","passed":selected_cost <= base_cost},
+                       {"label":"Connection weighted","passed":f.get("connecting_passengers",0)>0}],
+            "alternatives":alternatives}
+    for f in assignments: f["gateAnalysis"] = analyses[f["id"]]
+    return {"feasible":True,"assignments":assignments,"solver":f"OR-Tools {actual_solver} MILP",
+            "solveTimeMs":round((perf_counter()-started)*1000,2),"objective":summarize(assignments),"audit":result_audit}
 
 def compare_plans(baseline, optimized, closures=()):
     b, o = summarize(baseline,closures), summarize(optimized,closures)

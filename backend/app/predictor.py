@@ -41,6 +41,7 @@ def train_models(path: Path = ARTIFACT):
                                          l2_regularization=1.5, random_state=42).fit(X_train, y_train > THRESHOLD_MINUTES)
     yp, cp = reg.predict(X_test), clf.predict(X_test)
     prob = clf.predict_proba(X_test)[:, 1]
+    interval_half_width = float(np.quantile(np.abs(y_test - yp), .90))
     metrics = {"mae": round(float(mean_absolute_error(y_test, yp)), 3),
                "rmse": round(float(np.sqrt(mean_squared_error(y_test, yp))), 3),
                "r2": round(float(r2_score(y_test, yp)), 3),
@@ -50,7 +51,8 @@ def train_models(path: Path = ARTIFACT):
                "roc_auc": round(float(roc_auc_score(y_test > THRESHOLD_MINUTES, prob)), 3)}
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"regressor": reg, "classifier": clf, "metrics": metrics,
-                 "features": FEATURES, "threshold": THRESHOLD_MINUTES}, path)
+                 "features": FEATURES, "threshold": THRESHOLD_MINUTES,
+                 "intervalHalfWidth90": round(interval_half_width, 2)}, path)
 
 
 class DelayPredictor:
@@ -74,6 +76,7 @@ class DelayPredictor:
                             flight.get("connecting_passengers", 0), runway_capacity, gate_availability]])
         expected = max(0, float(self.bundle["regressor"].predict(values)[0]))
         risk = float(self.bundle["classifier"].predict_proba(values)[0, 1])
+        interval = self.bundle["intervalHalfWidth90"]
         # Transparent input contribution estimates, normalized for display; these are not model SHAP values.
         raw = {"Inbound rotation": flight.get("inbound_delay", 0) * .48,
                "Surface congestion": congestion * .13, "Weather impact": weather * .105,
@@ -82,4 +85,7 @@ class DelayPredictor:
         total = sum(max(0, v) for v in raw.values()) or 1
         drivers = [{"name": k, "value": round(max(0, v), 2), "share": round(max(0, v)/total*100, 1)}
                    for k, v in sorted(raw.items(), key=lambda item: item[1], reverse=True)]
-        return {"probability": round(risk, 4), "expectedMinutes": round(expected, 1), "drivers": drivers}
+        return {"probability": round(risk, 4), "expectedMinutes": round(expected, 1),
+                "predictionInterval": {"low": round(max(0, expected-interval), 1),
+                                       "high": round(expected+interval, 1)},
+                "confidence": .90, "drivers": drivers}
