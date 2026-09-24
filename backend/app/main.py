@@ -1,6 +1,7 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Literal
 from uuid import uuid4
 from fastapi import FastAPI, HTTPException
@@ -47,6 +48,8 @@ class RiskDriver(BaseModel):
 class RiskResult(BaseModel):
     probability: float
     expectedMinutes: float
+    predictionInterval: dict[str, float]
+    confidence: float
     drivers: list[RiskDriver]
 
 class FlightPlan(Flight):
@@ -54,6 +57,7 @@ class FlightPlan(Flight):
     gate: str | None = None
     status: str | None = None
     reason: str | None = None
+    gateAnalysis: dict | None = None
 
 class ModelStatus(BaseModel):
     mode: str
@@ -68,6 +72,7 @@ class Gate(BaseModel):
     wide: bool
     walk: int
     available: bool
+    remote: bool = False
 
 class CheckResult(BaseModel):
     name: str
@@ -98,6 +103,9 @@ class StateResponse(BaseModel):
     flights: list[FlightPlan]
     gates: list[Gate]
     model: ModelStatus | None
+    summary: dict
+    dataSource: str
+    lastUpdated: datetime
 
 class PlanResponse(BaseModel):
     runId: str
@@ -117,12 +125,19 @@ class PlanResponse(BaseModel):
     passengersProtected: float | None = None
     connectionExposureReduction: float | None = None
     solver: str | None = None
+    solveTimeMs: float | None = None
+    objective: dict | None = None
+    operationalSummary: dict | None = None
 
 class HistoryItem(BaseModel):
     runId: str
     generatedAt: datetime
     scenario: str
     feasible: bool
+    solver: str | None = None
+    solveTimeMs: float | None = None
+    objectiveValue: float | None = None
+    impact: float | None = None
 
 class HistoryResponse(BaseModel):
     items: list[HistoryItem]
@@ -130,6 +145,9 @@ class HistoryResponse(BaseModel):
 class PlanRequest(BaseModel):
     weather: int = Field(default=38, ge=0, le=100)
     congestion: int = Field(default=62, ge=0, le=100)
+    runway_capacity: float = Field(default=.82, ge=.1, le=1)
+    passenger_disruption: int = Field(default=0, ge=0, le=100)
+    safety_buffer: int = Field(default=15, ge=15, le=90)
     gate_closures: list[str] = Field(default_factory=list)
     flights: list[Flight] = Field(default_factory=lambda: [Flight(**f) for f in DEMO_FLIGHTS])
     solver: Literal["SCIP", "GUROBI"] = "SCIP"
@@ -160,30 +178,51 @@ def state_flights(req: PlanRequest):
     for model in req.flights:
         f=model.model_dump()
         f["scheduled"]=f["scheduled"].isoformat()
-        f["risk"]=predictor.predict(f,req.weather,req.congestion)
+        f["risk"]=predictor.predict(f,req.weather,req.congestion,req.runway_capacity)
+        f["safety_buffer"] = req.safety_buffer
+        if req.passenger_disruption:
+            factor = 1 + req.passenger_disruption / 100
+            f["passengers"] = min(600, round(f["passengers"] * factor))
+            f["connecting_passengers"] = min(f["passengers"], round(f["connecting_passengers"] * factor))
         rows.append(f)
     return rows
 
 def plan(req: PlanRequest, scenario_name="Current scenario"):
     flights=state_flights(req)
     baseline=baseline_plan(flights,req.gate_closures)
-    outcome=optimize_gates(flights,req.gate_closures,req.solver)
+    solve_started=perf_counter()
+    outcome=optimize_gates(flights,req.gate_closures,req.solver,req.safety_buffer)
+    solve_time=round((perf_counter()-solve_started)*1000,2)
     run_id=str(uuid4())
     if not outcome["feasible"]:
+        baseline_metrics=summarize(baseline,req.gate_closures,req.safety_buffer)
+        baseline_audit=audit(baseline,req.gate_closures,req.safety_buffer)
+        summary={"averageDelayMinutes":baseline_metrics["averageDelayMinutes"],
+                 "flightsAtRisk":sum(f["risk"]["probability"]>=.5 for f in flights),"flightCount":len(flights),
+                 "passengersProtected":0,"constraintAudit":baseline_audit,"remoteStands":baseline_metrics["remoteStands"],
+                 "passengerExposure":baseline_metrics["passengerExposure"],"connectionExposure":baseline_metrics["connectionExposure"],
+                 "gateUtilization":baseline_metrics["gateUtilization"]}
         result={"runId":run_id,"generatedAt":datetime.now(timezone.utc).isoformat(),"scenario":scenario_name,
                 "mode":"Simulation / Synthetic Operations Feed","feasible":False,"error":outcome["reason"],
-                "baseline":{"assignments":baseline,"metrics":summarize(baseline,req.gate_closures),"audit":audit(baseline,req.gate_closures)},
-                "solver":outcome.get("solver")}
+                "baseline":{"assignments":baseline,"metrics":baseline_metrics,"audit":baseline_audit},
+                "solver":outcome.get("solver"),"solveTimeMs":solve_time,"operationalSummary":summary}
     else:
-        comparison=compare_plans(baseline,outcome["assignments"],req.gate_closures)
+        comparison=compare_plans(baseline,outcome["assignments"],req.gate_closures,req.safety_buffer)
         connecting=sum(f["connecting_passengers"] for f in flights)
+        optimized_audit=outcome["audit"]
+        summary={"averageDelayMinutes":comparison["optimized"]["averageDelayMinutes"],
+                 "flightsAtRisk":sum(f["risk"]["probability"]>=.5 for f in flights),"flightCount":len(flights),
+                 "passengersProtected":comparison["passengersProtected"],"constraintAudit":optimized_audit,
+                 "remoteStands":comparison["optimized"]["remoteStands"],"passengerExposure":comparison["optimized"]["passengerExposure"],
+                 "connectionExposure":comparison["optimized"]["connectionExposure"],"gateUtilization":comparison["optimized"]["gateUtilization"]}
         result={"runId":run_id,"generatedAt":datetime.now(timezone.utc).isoformat(),"scenario":scenario_name,
                 "mode":"Simulation / Synthetic Operations Feed","feasible":True,"weather":req.weather,"congestion":req.congestion,
                 "assignments":outcome["assignments"],"baseline":{"assignments":baseline,"metrics":comparison["baseline"],"audit":comparison["auditBaseline"]},
                 "optimized":{"metrics":comparison["optimized"],"audit":outcome["audit"]},"comparison":comparison,
                 "connectingPassengers":connecting,"connectionRisk":round(comparison["optimized"]["connectionExposure"],2),
                 "passengersProtected":comparison["passengersProtected"],
-                "connectionExposureReduction":comparison["improvement"]["connectionExposure"],"solver":outcome["solver"]}
+                "connectionExposureReduction":comparison["improvement"]["connectionExposure"],"solver":outcome["solver"],
+                "solveTimeMs":solve_time,"objective":outcome["objective"],"operationalSummary":summary}
     history[run_id]=result
     return result
 
@@ -195,8 +234,15 @@ def get_state():
     req=PlanRequest()
     flights=state_flights(req)
     scheduled=baseline_plan(flights,[])
+    baseline_audit=audit(scheduled,[])
+    summary={"averageDelayMinutes":round(sum(f["risk"]["expectedMinutes"] for f in flights)/max(1,len(flights)),1),
+             "flightsAtRisk":sum(f["risk"]["probability"]>=.5 for f in flights),"flightCount":len(flights),
+             "passengersProtected":None,"constraintAudit":baseline_audit,
+             "remoteStands":0,"passengerExposure":summarize(scheduled)["passengerExposure"],
+             "connectionExposure":summarize(scheduled)["connectionExposure"],"gateUtilization":summarize(scheduled)["gateUtilization"]}
     return {"mode":"Simulation / Synthetic Operations Feed","airport":"DEL","weather":req.weather,"congestion":req.congestion,
-            "flights":scheduled,"gates":GATES,"model":predictor.status if predictor else None}
+            "runway_capacity":req.runway_capacity,"flights":scheduled,"gates":GATES,"model":predictor.status if predictor else None,
+            "summary":summary,"dataSource":"Simulation / Synthetic Operations Feed","lastUpdated":datetime.now(timezone.utc)}
 
 @app.get("/api/flights", response_model=list[FlightPlan])
 def get_flights(): return state_flights(PlanRequest())
@@ -221,7 +267,9 @@ def optimize(request: PlanRequest): return plan(request)
 def simulate(request: ScenarioRequest): return plan(request,request.name)
 
 @app.get("/api/optimization/history", response_model=HistoryResponse)
-def get_history(): return {"items":[{"runId":k,"generatedAt":v["generatedAt"],"scenario":v["scenario"],"feasible":v["feasible"]} for k,v in history.items()]}
+def get_history(): return {"items":[{"runId":k,"generatedAt":v["generatedAt"],"scenario":v["scenario"],"feasible":v["feasible"],
+    "solver":v.get("solver"),"solveTimeMs":v.get("solveTimeMs"),"objectiveValue":(v.get("objective") or {}).get("objectiveValue"),
+    "impact":v.get("connectionExposureReduction")} for k,v in history.items()]}
 
 @app.get("/api/optimization/{run_id}", response_model=PlanResponse)
 def get_run(run_id: str):

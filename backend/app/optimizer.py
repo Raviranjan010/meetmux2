@@ -65,7 +65,7 @@ def objective_breakdown(assignments):
         for k, v in _cost(f, f["gate"]).items(): result[k] += v
     return {k: round(v, 2) for k,v in result.items()}
 
-def audit(assignments, closed):
+def audit(assignments, closed, buffer=BUFFER):
     byname = {k: [] for k in ("aircraftCompatibility", "terminalCompatibility", "gateClosures", "temporalConflicts", "turnaround", "buffer", "gateOperationalAvailability", "connectionConstraints")}
     for f in assignments:
         gate = next((g for g in GATES if g["id"] == f["gate"]), None)
@@ -74,12 +74,12 @@ def audit(assignments, closed):
         byname["gateClosures"].append(f["gate"] not in closed)
         byname["gateOperationalAvailability"].append(not gate or gate["available"])
         byname["turnaround"].append(f.get("turnaround", 45) >= 30)
-        byname["buffer"].append(f.get("safety_buffer", BUFFER) >= BUFFER)
+        byname["buffer"].append(f.get("safety_buffer", BUFFER) >= buffer)
         byname["connectionConstraints"].append(f.get("connecting_passengers", 0) <= f.get("passengers", 0))
     temporal = []
     for i, a in enumerate(assignments):
         for b in assignments[i+1:]:
-            if a["gate"] == b["gate"] and a["gate"] != "REMOTE": temporal.append(not overlap(a,b))
+            if a["gate"] == b["gate"] and a["gate"] != "REMOTE": temporal.append(not overlap(a,b,buffer))
     byname["temporalConflicts"] = temporal
     checks = [{"name": k, "passed": sum(v), "total": len(v), "percentage": round(100*sum(v)/len(v),1) if v else 100.0}
               for k,v in byname.items()]
@@ -88,7 +88,7 @@ def audit(assignments, closed):
             "percentage": round(100*passed/total,1) if total else 100.0,
             "valid": all(c["passed"] == c["total"] for c in checks)}
 
-def _impact_by_flight(assignments, closures=()):
+def _impact_by_flight(assignments, closures=(), buffer=BUFFER):
     result = {}
     for f in assignments:
         gate = next((g for g in GATES if g["id"] == f["gate"]), None)
@@ -100,7 +100,7 @@ def _impact_by_flight(assignments, closures=()):
                            "connections":f["risk"]["expectedMinutes"]+penalty}
     for i, a in enumerate(assignments):
         for b in assignments[i+1:]:
-            if a["gate"] == b["gate"] and a["gate"] != "REMOTE" and overlap(a,b):
+            if a["gate"] == b["gate"] and a["gate"] != "REMOTE" and overlap(a,b,buffer):
                 result[a["id"]]["passengers"] += 30; result[b["id"]]["passengers"] += 30
                 result[a["id"]]["connections"] += 30; result[b["id"]]["connections"] += 30
     return result
@@ -109,7 +109,7 @@ def summarize(assignments, closures=(), buffer=BUFFER):
     n = len(assignments) or 1
     breakdown = objective_breakdown(assignments)
     delay = sum(f["risk"]["expectedMinutes"] for f in assignments)
-    impacts = _impact_by_flight(assignments, closures)
+    impacts = _impact_by_flight(assignments, closures, buffer)
     exposure = sum(impacts[f["id"]]["passengers"] * f.get("passengers",0) for f in assignments)
     connection = sum(impacts[f["id"]]["connections"] * f.get("connecting_passengers",0) for f in assignments)
     return {"averageDelayMinutes": round(delay/n,2), "delayExposure": round(exposure,2),
@@ -154,7 +154,7 @@ def optimize_gates(flights, closures, solver="SCIP", buffer=BUFFER):
         if gate is None:
             return {"feasible":False,"reason":"Solver returned an incomplete assignment; plan rejected.","solver":f"OR-Tools {actual_solver} MILP"}
         assignments.append({**f,"gate":gate,"status":"Optimized","reason":"Minimum weighted disruption cost under hard gate constraints"})
-    result_audit=audit(assignments,closures)
+    result_audit=audit(assignments,closures,buffer)
     if not result_audit["valid"]:
         return {"feasible":False,"reason":"Solver solution failed the post-solve constraint audit and was rejected.","solver":f"OR-Tools {actual_solver} MILP","audit":result_audit}
     by_gate = {f["gate"]: f for f in assignments}
@@ -187,14 +187,14 @@ def optimize_gates(flights, closures, solver="SCIP", buffer=BUFFER):
     return {"feasible":True,"assignments":assignments,"solver":f"OR-Tools {actual_solver} MILP",
             "solveTimeMs":round((perf_counter()-started)*1000,2),"objective":summarize(assignments),"audit":result_audit}
 
-def compare_plans(baseline, optimized, closures=()):
-    b, o = summarize(baseline,closures), summarize(optimized,closures)
+def compare_plans(baseline, optimized, closures=(), buffer=BUFFER):
+    b, o = summarize(baseline,closures,buffer), summarize(optimized,closures,buffer)
     measures = ["averageDelayMinutes", "delayExposure", "remoteStands", "passengerExposure", "connectionExposure"]
-    baseline_impact, optimized_impact = _impact_by_flight(baseline,closures), _impact_by_flight(optimized,closures)
+    baseline_impact, optimized_impact = _impact_by_flight(baseline,closures,buffer), _impact_by_flight(optimized,closures,buffer)
     protected = sum(f.get("connecting_passengers",0) for f in optimized
                     if baseline_impact.get(f["id"],{}).get("connections",0) > optimized_impact.get(f["id"],{}).get("connections",0))
     return {"baseline":b,"optimized":o,"improvement":{k:round(b[k]-o[k],2) for k in measures},
             "passengersProtected":protected,
-            "gateConflicts":{"baseline":sum(1 for i,a in enumerate(baseline) for c in baseline[i+1:] if a["gate"]==c["gate"] and a["gate"]!="REMOTE" and overlap(a,c)),
-                             "optimized":sum(1 for i,a in enumerate(optimized) for c in optimized[i+1:] if a["gate"]==c["gate"] and a["gate"]!="REMOTE" and overlap(a,c))},
-            "auditBaseline":audit(baseline,closures), "auditOptimized":audit(optimized,closures)}
+            "gateConflicts":{"baseline":sum(1 for i,a in enumerate(baseline) for c in baseline[i+1:] if a["gate"]==c["gate"] and a["gate"]!="REMOTE" and overlap(a,c,buffer)),
+                             "optimized":sum(1 for i,a in enumerate(optimized) for c in optimized[i+1:] if a["gate"]==c["gate"] and a["gate"]!="REMOTE" and overlap(a,c,buffer))},
+            "auditBaseline":audit(baseline,closures,buffer), "auditOptimized":audit(optimized,closures,buffer)}
