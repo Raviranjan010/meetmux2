@@ -1,36 +1,35 @@
-# SkyFlow — Predictive Air Traffic & Gate Optimizer
+# SkyFlow — Airport Operations Decision Support
 
-Hackathon-ready React + FastAPI platform that predicts runway/taxi delay risk and assigns gates with an OR-Tools mixed-integer linear programming (MILP) model.
+SkyFlow is a deterministic hackathon demo for airport delay prediction, risk explanation, and gate planning. Its built-in feed is synthetic and is clearly labeled **Simulation / Synthetic Operations Feed**; it is not a live airport feed.
 
-## Run
+## Run locally
 
 ```powershell
-# API
+# Backend
 cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+..\.venv\Scripts\python.exe -m app.train_models  # one-time model artifact generation
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 
-# UI (new terminal)
+# Frontend, in another terminal
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173`. The UI works in Demo Mode even when the API is not running.
-
-Or run the complete stack with Docker:
+Open `http://localhost:5173`; the API documentation is at `http://localhost:8000/docs`. Docker builds the model artifact in the API image before startup:
 
 ```powershell
 docker compose up --build
 ```
 
-Then open `http://localhost:5173`; API documentation is at `http://localhost:8000/docs`.
+## Implemented flow
 
-## Highlights
+- Separate Scikit-Learn regression and classification models. The classifier directly predicts `P(delay > 15 minutes)`; it is not derived from regression output. The deterministic synthetic dataset is trained once by `app.train_models` and the saved artifact is loaded during API startup.
+- Holdout MAE, RMSE, R², precision, recall, F1, and ROC-AUC are returned from `/api/model/status`. These metrics describe synthetic holdout data, not airport performance.
+- Driver values and shares are computed from actual prediction inputs and returned with each flight prediction.
+- OR-Tools SCIP MILP uses binary flight/gate assignment variables, with exact assignment, gate/aircraft/terminal compatibility, gate closure, turnaround, safety buffer, and non-overlap constraints. Gurobi is optional; missing Gurobi falls back to SCIP. The solver never describes SCIP as CP-SAT.
+- Baseline and optimized plans include calculated cost breakdowns, constraint audits, passenger and connection exposure, gate conflicts, and improvement values. Infeasible instances return an error and no optimized assignments.
+- API routes: `/health`, `/api/state`, `/api/flights`, `/api/gates`, `/api/model/status`, `/api/predict`, `/api/optimize`, `/api/scenarios/simulate`, `/api/optimization/history`, and `/api/optimization/{run_id}`.
 
-- Scikit-learn gradient-boosting predictor using weather, surface congestion, inbound delay, peak-bank and aircraft features
-- Gate allocation MILP with binary assignment decisions, aircraft compatibility, gate closures, time conflicts and 15-minute safety buffers
-- OR-Tools SCIP MILP solver; deterministic heuristic fallback for lightweight demos
-- Live operations board, timeline, scenario controls, and disruption-aware recommendations
+Replace the synthetic feed and retrain with validated historical A-CDM/ADS-B data before operational use. Prediction explanations are transparent input contribution estimates, not SHAP explanations.
